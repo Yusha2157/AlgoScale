@@ -1,61 +1,99 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const crypto = require('crypto');
 
-const TIMEOUT_MS = 3000;
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const COMPILE_TIMEOUT_MS = 10_000;  // 10 seconds for compilation
+const RUN_TIMEOUT_MS = 3_000;   // 3 seconds for execution
 const DOCKER_IMAGE = 'gcc:latest';
+const MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB output cap
 
-/**
- * Wrap user code inside a controlled main() / solve() template.
- * The user implements the body of solve(); we control entry point.
- */
+
+const CONTAINER_EXEC_DIR = '/execution';
+
+
+const EXECUTION_VOLUME = process.env.EXECUTION_VOLUME || 'algoscale_execution-data';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Wrap user code inside a controlled main()/solve() template. */
 function generateWrappedCode(userCode) {
-    return `
-#include <bits/stdc++.h>
-using namespace std;
-
-// --- user code start ---
-${userCode}
-// --- user code end ---
-
-int main() {
-    ios_base::sync_with_stdio(false);
-    cin.tie(NULL);
-    solve();
-    return 0;
+    return [
+        '#include <bits/stdc++.h>',
+        'using namespace std;',
+        '',
+        '// --- user code start ---',
+        userCode,
+        '// --- user code end ---',
+        '',
+        'int main() {',
+        '    ios_base::sync_with_stdio(false);',
+        '    cin.tie(NULL);',
+        '    solve();',
+        '    return 0;',
+        '}',
+        '',
+    ].join('\n');
 }
-`;
+
+/** Create a unique run directory under /execution. */
+function createRunDir() {
+    fs.mkdirSync(CONTAINER_EXEC_DIR, { recursive: true });
+    const id = crypto.randomBytes(8).toString('hex');
+    const dir = path.join(CONTAINER_EXEC_DIR, `run-${id}`);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+}
+
+/** Best-effort cleanup of a run directory. */
+function cleanupDir(dirPath) {
+    try { fs.rmSync(dirPath, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
 /**
- * Run a child process and collect stdout/stderr.
- * Resolves with { code, stdout, stderr } or rejects on timeout.
+ * Spawn a child process and collect stdout/stderr with bounded buffers.
+ * Resolves with { code, stdout, stderr } or rejects with a tagged Error.
  */
-function runProcess(command, args, options = {}) {
+function runProcess(command, args, { timeout, timeoutTag }) {
     return new Promise((resolve, reject) => {
-        const proc = spawn(command, args, {
-            ...options,
-            stdio: ['pipe', 'pipe', 'pipe'],
-        });
+        const proc = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
         let stdout = '';
         let stderr = '';
+        let stdoutLen = 0;
+        let stderrLen = 0;
 
-        proc.stdout.on('data', (data) => { stdout += data.toString(); });
-        proc.stderr.on('data', (data) => { stderr += data.toString(); });
+        proc.stdout.on('data', (data) => {
+            const chunk = data.toString();
+            if (stdoutLen < MAX_OUTPUT_BYTES) {
+                stdout += chunk.slice(0, MAX_OUTPUT_BYTES - stdoutLen);
+                stdoutLen += chunk.length;
+            }
+        });
+
+        proc.stderr.on('data', (data) => {
+            const chunk = data.toString();
+            if (stderrLen < MAX_OUTPUT_BYTES) {
+                stderr += chunk.slice(0, MAX_OUTPUT_BYTES - stderrLen);
+                stderrLen += chunk.length;
+            }
+        });
 
         let killed = false;
         const timer = setTimeout(() => {
             killed = true;
             proc.kill('SIGKILL');
-        }, options.timeout || TIMEOUT_MS);
+        }, timeout);
 
         proc.on('close', (code) => {
             clearTimeout(timer);
-            if (killed) {
-                return reject(new Error('TIME_LIMIT_EXCEEDED'));
-            }
+            if (killed) return reject(new Error(timeoutTag));
             resolve({ code, stdout, stderr });
         });
 
@@ -64,102 +102,109 @@ function runProcess(command, args, options = {}) {
             reject(err);
         });
 
-        // Close stdin immediately – we don't pipe any input yet
         proc.stdin.end();
     });
 }
 
-/**
- * Create a unique temporary working directory, returning its path.
- */
-function createTempDir() {
-    
-    return fs.mkdtempSync(path.join(os.tmpdir(), 'algoscale-cpp-'));
-}
+// ---------------------------------------------------------------------------
+// Docker compile & execute
+// ---------------------------------------------------------------------------
 
-/**
- * Remove a directory and all its contents.
- */
-function cleanupDir(dirPath) {
-    try {
-        fs.rmSync(dirPath, { recursive: true, force: true });
-    } catch {
-        // Best-effort cleanup; ignore errors
-    }
-}
 
-/**
- * Compile user C++ code inside a Docker container.
- *
- * @param {string} workDir  – host path containing solution.cpp
- * @returns {Promise<{code, stdout, stderr}>}
- */
-function compile(workDir) {
+function compile(runId) {
+    const compileCmd = [
+        `cd /volume/run-${runId}`,
+        'echo "--- workspace listing ---"',
+        'ls -la .',
+        'echo "--- compiling ---"',
+        'g++ -o solution -std=c++17 -O2 solution.cpp',
+        'chmod +x solution',
+    ].join(' && ');
+
     const args = [
-        'run',
-        '--rm',
+        'run', '--rm',
         '--network=none',
-        '--memory=128m',
-        '--cpus=0.5',
+        '--memory=256m',
         '--pids-limit=64',
-        '-v', `${workDir}:/workspace`,
-        '-w', '/workspace',
+        '-v', `${EXECUTION_VOLUME}:/volume`,
         DOCKER_IMAGE,
-        'g++',
-        '-o', 'solution',
-        '-std=c++17',
-        '-O2',
-        'solution.cpp',
+        'sh', '-c', compileCmd,
     ];
 
-    return runProcess('docker', args, { timeout: TIMEOUT_MS });
+    return runProcess('docker', args, {
+        timeout: COMPILE_TIMEOUT_MS,
+        timeoutTag: 'COMPILE_TIMEOUT',
+    });
 }
 
 /**
- * Run the compiled binary inside a Docker container with strict security flags.
- *
- * @param {string} workDir  – host path containing the compiled binary
- * @returns {Promise<{code, stdout, stderr}>}
+ * Run the compiled binary inside a Docker container with strict limits.
  */
-function execute(workDir) {
+function execute(runId) {
     const args = [
-        'run',
-        '--rm',
+        'run', '--rm',
         '--network=none',
         '--memory=128m',
         '--cpus=0.5',
         '--pids-limit=64',
-        '--read-only',
-        '-v', `${workDir}:/workspace:ro`,
-        '-w', '/workspace',
+        '-v', `${EXECUTION_VOLUME}:/volume`,
+        '-w', `/volume/run-${runId}`,
         DOCKER_IMAGE,
         './solution',
     ];
 
-    return runProcess('docker', args, { timeout: TIMEOUT_MS });
+    return runProcess('docker', args, {
+        timeout: RUN_TIMEOUT_MS,
+        timeoutTag: 'RUNTIME_TIMEOUT',
+    });
 }
 
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
 /**
- * Main entry point – compile and run a C++ submission.
- *
- * @param {string} code – raw user code (body of solve())
- * @returns {Promise<{success: boolean, stdout: string, stderr: string, executionTime: number}>}
+ * Compile and run a C++ submission.
+ * @param {string} code  Raw user code (body of solve())
+ * @returns {Promise<{success:boolean, stdout:string, stderr:string, executionTime:number}>}
  */
 async function executeCpp(code) {
-    
-    const workDir = createTempDir();
-    
-    try {
-        // 1. Write the wrapped source file
-        const wrappedCode = generateWrappedCode(code);
-        fs.writeFileSync(path.join(workDir, 'solution.cpp'), wrappedCode);
-        console.log("Execution started : ");
+    if (!code || typeof code !== 'string') {
+        return { success: false, stdout: '', stderr: 'No code provided', executionTime: 0 };
+    }
 
-        // 2. Compile
-        const compileResult = await compile(workDir);
-        console.log("Executing..");
+    const runDir = createRunDir();
+    // Extract the run-ID portion so sibling containers can reference the
+    // subdirectory inside the named volume.
+    const runId = path.basename(runDir).replace('run-', '');
+
+    console.log(`[DIAG] workDir (container):  ${runDir}`);
+    console.log(`[DIAG] volume name:          ${EXECUTION_VOLUME}`);
+    console.log(`[DIAG] run ID:               ${runId}`);
+
+    try {
+        // ---- Write source file ------------------------------------------------
+        const srcPath = path.join(runDir, 'solution.cpp');
+        fs.writeFileSync(srcPath, generateWrappedCode(code));
+
+        const srcExists = fs.existsSync(srcPath);
+        console.log(`[DIAG] solution.cpp exists: ${srcExists}`);
+
+        if (!srcExists) {
+            return { success: false, stdout: '', stderr: 'Internal error: failed to write source file', executionTime: 0 };
+        }
+
+        // ---- Compile ----------------------------------------------------------
+        console.log(`[DIAG] Compile volume mount: ${EXECUTION_VOLUME}:/volume (subdir run-${runId})`);
+        const compileResult = await compile(runId);
+
+        // Log compile stdout (contains diagnostic ls output)
+        if (compileResult.stdout) {
+            console.log(`[DIAG] Compile stdout:\n${compileResult.stdout}`);
+        }
 
         if (compileResult.code !== 0) {
+            console.log(`[DIAG] Compilation failed (exit ${compileResult.code})`);
             return {
                 success: false,
                 stdout: '',
@@ -167,11 +212,20 @@ async function executeCpp(code) {
                 executionTime: 0,
             };
         }
+        console.log('[DIAG] Compilation succeeded');
 
-        // 3. Execute
-        console.log("Almost there");
+        // ---- Verify binary exists ---------------------------------------------
+        const binPath = path.join(runDir, 'solution');
+        const binExists = fs.existsSync(binPath);
+        console.log(`[DIAG] solution binary exists: ${binExists}`);
+
+        if (!binExists) {
+            return { success: false, stdout: '', stderr: 'Internal error: compiled binary not found', executionTime: 0 };
+        }
+
+        // ---- Execute ----------------------------------------------------------
         const startTime = Date.now();
-        const runResult = await execute(workDir);
+        const runResult = await execute(runId);
         const executionTime = Date.now() - startTime;
 
         return {
@@ -181,22 +235,17 @@ async function executeCpp(code) {
             executionTime,
         };
     } catch (err) {
-        if (err.message === 'TIME_LIMIT_EXCEEDED') {
-            return {
-                success: false,
-                stdout: '',
-                stderr: 'Time Limit Exceeded (3s)',
-                executionTime: TIMEOUT_MS,
-            };
+        // ---- Timeout & error handling -----------------------------------------
+        if (err.message === 'COMPILE_TIMEOUT') {
+            return { success: false, stdout: '', stderr: 'Compilation timed out', executionTime: COMPILE_TIMEOUT_MS };
         }
-        return {
-            success: false,
-            stdout: '',
-            stderr: err.message || 'Unknown error',
-            executionTime: 0,
-        };
+        if (err.message === 'RUNTIME_TIMEOUT') {
+            return { success: false, stdout: '', stderr: 'Time Limit Exceeded', executionTime: RUN_TIMEOUT_MS };
+        }
+        console.error(`[DIAG] Unexpected error: ${err.message}`);
+        return { success: false, stdout: '', stderr: err.message || 'Unknown error', executionTime: 0 };
     } finally {
-        cleanupDir(workDir);
+        cleanupDir(runDir);
     }
 }
 
